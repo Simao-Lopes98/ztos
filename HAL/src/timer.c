@@ -88,8 +88,9 @@ static void timer2Init (void)
     /* 
     Value to be compared with calculated by:
     fout = fclk / ((PSC + 1) x (ARR + 1))
+    For this config, 16 with 512 PSC will lead to timer being triggered each 10ms
     */
-    TIM2->ARR = 15593;
+    TIM2->ARR = 16;
     
     /* Enable IRQ */
     NVIC_EnableIRQ (TIM2_IRQn);
@@ -97,15 +98,6 @@ static void timer2Init (void)
     /* Enable ISR */
     TIM2->DIER |= TIM_DIER_UIE;
 
-}
-
-void TIM2_IRQHandler(void)
-{
-    /* Clear */
-    TIM2->SR &= ~TIM_SR_UIF;
-
-    /* DBG: Toggle LED*/
-    GPIOC->ODR ^= 1 << 13;
 }
 
 static STATUS checkTimerDrvNum (timerDrvNum_t timerNum)
