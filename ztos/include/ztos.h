@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stm32f1xx.h>
+#include <core_cm3.h>
 #include <string.h>
 
 #include "clock.h"

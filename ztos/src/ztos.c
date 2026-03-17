@@ -8,6 +8,8 @@
 
 /* Private variables */
 static sllCtrl_t * taskList = NULL;
+static zTask_t * currentTask = NULL;
+static zTask_t * idleTask = NULL;
 
 /* Private function prototypes */
 static void zIdleTask (void);
@@ -17,6 +19,14 @@ static void setupTaskStack (zTask_t * task);
 /* Public functions */
 STATUS zSchedInit (void)
 {
+    /* 
+    Set pendSV interruption level to the lowest.
+    pendSV is triggered when the RTOS has to context switch.
+    As to not interfere with the system and other system interrupts.
+    */
+
+
+
     /* Start Timer for tick */
     (void) timerDrvInit(TIMER_DRV_2);
     
@@ -83,20 +93,126 @@ STATUS zTaskCreate (char * name,
     return OK;
 }
 
+zTask_t * zGetTaskByName (char * name)
+{
+    sllNode_t * currNode = taskList->firstNode;
+    zTask_t * currTask = NULL;
+
+    if (name == NULL)
+    {
+        return NULL;
+    }
+
+    while (currNode != NULL)
+    {
+        currTask = (zTask_t*) currNode->data;
+
+        if (strncmp (name, currTask->name, MAX_TASK_NAME) == 0)
+        {
+            return currTask;
+        }
+
+        currNode = currNode->nextNode;
+    }
+
+    return NULL;
+}
+
+/* 
+IRQ from TIM2 serves as heart-beat.
+Routine updates ticks and triggers pendSV.
+*/
 void TIM2_IRQHandler(void)
 {
     /* Clear */
     TIM2->SR &= ~TIM_SR_UIF;
 
-    /* DBG: Toggle LED*/
-    GPIOC->ODR ^= 1 << 13;
 }
 
 /* Private functions */
 
+/* Triggers pendSV */
+static zTaskYield (void)
+{
+    /* Trigger pendSV ISR */
+    SCB->ICSR |= SCB_ICSR_PENDSVSET_Msk;
+}
+
+/* Task Switcher - Routine goes through the task list */
+static void ztaskSwitcher (void)
+{    
+    static sllNode_t *  currNode = NULL;
+    sllNode_t *         startNode = NULL;
+    zTask_t *           currTask = NULL;
+
+    /* Point to the head node as the main task is the 1st to run */
+    if (currNode == NULL)
+    {
+        currNode = taskList->firstNode;
+    }
+
+    /* Start from next task in round-robin order */
+    currNode = (currNode->nextNode != NULL) ? 
+                currNode->nextNode : taskList->firstNode;
+
+    /* Remenber where the search started */
+    startNode = currNode;
+    
+    currTask = (zTask_t *) currNode->data;
+
+    while (currNode != startNode)
+    {
+        if (currTask->status == TASK_RUNNING)
+        {
+            /* Save the task to execute into the global var */
+            currentTask = currTask;
+            return;
+        }
+
+        /* Iterate */
+        currNode = (currNode->nextNode != NULL) ? 
+                    currNode->nextNode : taskList->firstNode;
+    }
+    
+    /* No RUNNING task found — fallback to idle or first task */
+    currentTask = idleTask;
+}
+
+/* Tick management routine - Decrements ticks from STOPPED tasks */
+static void zTickManagment (void)
+{
+    
+    sllNode_t * currNode = taskList->firstNode;
+    zTask_t * currTask = NULL;
+
+    /* Iterate each task */
+    while (currNode != NULL)
+    {
+        currTask = (zTask_t *) currNode->data;
+
+        if (currTask->status == TASK_STOPPED && currTask->ticks >= 0)
+        {
+            if (currTask->ticks == 0)
+            {
+                /* Mark the task as RUNNING */
+                currTask->status = TASK_RUNNING;
+            }
+            else
+            {
+                /* Decrement ticks to delay */
+                currTask->ticks--;
+            }
+            
+        }
+        currNode = currNode->nextNode;
+    }
+
+}
+
 /*
-TODO: The tasks should not return and have no input args. 
-This could be improved.. To do so, LR and R0 have to be properly setup 
+Function creates a stack-ready when called by the exception.
+This follows the stack on section 5.5.1 Stacking of ARM Cortex M3
+TODO: The tasks should not return and have no input args. This could be improved.. To do so, LR and R0 have to be properly setup 
 */
 static void setupTaskStack (zTask_t * task)
 {
@@ -109,14 +225,17 @@ static void setupTaskStack (zTask_t * task)
     * (-- stack) = 0x01000000;
 
     /* Setup the PC register to the function entry point */
-    * (-- stack) = (uint32_t * ) task->entryFn;
+    * (-- stack) = (uint32_t) task->entryFn;
 
-    /* Setup the LR - Tasks should not return */
-    * (-- stack) = (uint32_t * ) 0xDEADBEEF;
+    /* 
+    Setup the LR - Tasks should not return 
+    TODO: Add the feature for a task to return
+    */
+    * (-- stack) = 0xDEADBEEF;
 
     for (size_t i = 0; i < DUMMY_REGISTERS_NUM; i++)
     {
-        /* Setup the GP Register with a dummy value */
+        /* Setup the GP Register (i.e. R4, R11, ...) with a dummy value */
         * (-- stack) = 0xDEADBEEF;
     }
     
@@ -128,7 +247,9 @@ static void zIdleTask (void)
 {
     while (1)
     {
+        /* Do nothing */
         __asm volatile ("nop");
+        /* Never return */
     }
     
 }
@@ -161,6 +282,9 @@ static STATUS createIdleTask (void)
     {
         return ERROR;
     }
+
+    /* Save in the global context */
+    idleTask = idleTcb;
 
     return OK;
 }
