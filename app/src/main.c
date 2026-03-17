@@ -8,6 +8,7 @@
 #include "gpio.h"
 #include "uart.h"
 #include "timer.h"
+#include "sllinkedlist.h"
 
 
 char msg[USART_RCV_BUFF_MAX_SIZE];
@@ -30,15 +31,14 @@ int main(void)
 
 	SYSTEM_LOG ("USART Drv 1 Enabled!");
 
-	(void) timerDrvInit(TIMER_DRV_2);
-	(void) timerDrvEnable (TIMER_DRV_2);
-
-	SYSTEM_LOG ("TIMER Drv 2 Enabled!");
 
 	while(1)
 	{
 		/* Blink */
 		SYSTEM_LOG ("System heartbeat");
+
+		/* DBG: Toggle LED*/
+		GPIOC->ODR ^= 1 << 13;
 
 		/* DBG */
 		printf ("TIM Counter: %lu\r\n", TIM2->CNT);
