@@ -25,13 +25,12 @@ static void ztaskSwitcher (void);
 /* Public functions */
 STATUS zSchedInit (void)
 {
-
     /* Start Timer for tick */
     (void) timerDrvInit(TIMER_DRV_2);
     
     /* Create SLL for task nodes */
     taskList = sllCreate ();
-    if (taskList != OK)
+    if (taskList == NULL)
     {
         return ERROR;
     }
@@ -44,6 +43,13 @@ STATUS zSchedInit (void)
 
     /* Setup PendSV interrupt */
     zSetupPendSV();
+
+    /* Set the PSP to a valid RAM stack. Using the currentTask (i.e. IdleTask) */
+    __set_PSP((uint32_t)currentTask->currentStackPtr);
+    
+    /* From now on, use PSP in Thread mode */
+    __set_CONTROL(0x02); 
+    __ISB();             // Flush pipeline
 
 	(void) timerDrvEnable (TIMER_DRV_2);
 
@@ -156,9 +162,6 @@ void TIM2_IRQHandler(void)
 
     if (currentTask != newTaskToRun)
     {
-        /* Update newTaskToRun to the currentTask */
-        // newTaskToRun = currentTask;
-
         zTaskYield();
     }
 
@@ -172,13 +175,16 @@ not to push/pop additional registers to/from the stack.
 Important - On ARM Cortex M3, when the processor invokes an exception, 
 it automatically pushes the following eight registers to the SP in the 
 following order: PC, xPSR, R0-R3, R12, LR.
+
+Internal logic should avoid using registers R4 to R11 as it could corrupt the task stack.
+As such, one should just use R0-R3.
 */
 __attribute__((naked))
 void PendSV_Handler(void)
 {
     __asm volatile (/* Disable lower prio interrupts */
-                    "MOVS R5, #0x55 \t\n"   /* Disables interrupt with priority */
-                    "MSR BASEPRI, R5\t\n"   /* 0x55-0xFF using the CMSIS-CORE function*/
+                    "MOVS R0, #0x55 \t\n"   /* Disables interrupt with priority */
+                    "MSR BASEPRI, R0\t\n"   /* 0x55-0xFF using the CMSIS-CORE function*/
                     "ISB            \t\n"   /* Instruction Synchronization Barrier */
                     
                     /* Save the context */
@@ -190,10 +196,10 @@ void PendSV_Handler(void)
 
 
                     /* Update current task */
-                    "LDR R3, =newTaskToRun       \t\n"
-                    "LDR R4, =currentTask        \t\n"
-                    "LDR R5, [R3]                \t\n"
-                    "STR R5, [R4]                \t\n"
+                    "LDR R0, =newTaskToRun       \t\n"
+                    "LDR R1, =currentTask        \t\n"
+                    "LDR R2, [R0]                \t\n"
+                    "STR R2, [R1]                \t\n"
 
                     /* Restore the context of the new task */
                     "LDR R0, =currentTask       \t\n"   /* Get the new Task's Stack Pointer into R3 */
@@ -203,8 +209,8 @@ void PendSV_Handler(void)
                     "MSR PSP, R1                \t\n"   /* Load the PSP into the currentTask->stackPtr */
 
                     /* Enable lower prio interrupts */
-                    "MOVS R5, #0x00 \t\n" 
-                    "MSR BASEPRI, R5\t\n"   
+                    "MOVS R0, #0x00 \t\n" 
+                    "MSR BASEPRI, R0\t\n"   
 
                     "BX LR          \t\n"   /* Exeception return */
                 ); 
@@ -230,6 +236,8 @@ static void zTaskYield (void)
 {
     /* Trigger PendSV ISR */
     SCB->ICSR |= SCB_ICSR_PENDSVSET_Msk;
+    __DSB ();
+    __ISB ();
 }
 
 /* Task Switcher - Routine goes through the task list */
@@ -239,23 +247,30 @@ static void ztaskSwitcher (void)
     sllNode_t *         startNode = NULL;
     zTask_t *           currTask = NULL;
 
+    /* Only idle task in the system */
+    if (taskList->numberOfNodes == 0)
+    {
+        newTaskToRun = idleTask;
+        return;
+    }
+
     /* Point to the head node as the main task is the 1st to run */
     if (currNode == NULL)
     {
         currNode = taskList->firstNode;
     }
 
-    /* Start from next task in round-robin order */
-    currNode = (currNode->nextNode != NULL) ? 
-                currNode->nextNode : taskList->firstNode;
-
     /* Remenber where the search started */
     startNode = currNode;
-    
-    currTask = (zTask_t *) currNode->data;
 
-    while (currNode != startNode)
+    do
     {
+        /* Start from next task in round-robin order */
+        currNode = (currNode->nextNode != NULL) ? 
+                    currNode->nextNode : taskList->firstNode;
+                    
+        currTask = (zTask_t *) currNode->data;
+
         if (currTask->status == TASK_RUNNING)
         {
             /* Save the task to execute into the global var */
@@ -263,10 +278,7 @@ static void ztaskSwitcher (void)
             return;
         }
 
-        /* Iterate */
-        currNode = (currNode->nextNode != NULL) ? 
-                    currNode->nextNode : taskList->firstNode;
-    }
+    } while (currNode != startNode);
     
     /* No RUNNING task found — fallback to idle or first task */
     newTaskToRun = idleTask;
@@ -310,30 +322,33 @@ TODO: The tasks should not return and have no input args. This could be improved
 */
 static void zSetupTaskStack (zTask_t * task)
 {
-    uint32_t * stack = (uint32_t *) ((uint32_t *) task->stackPtr + task->stackSize);
+    /* Get the top of the stack */
+    uint32_t * stack = (uint32_t *)((uint8_t *)task->stackPtr + task->stackSize);
 
-    /* Align memory to 8 Bits */
+    /* Align to 8 bytes */
     stack = (uint32_t *)(((uint32_t)stack) & ~0x07);
 
-    /* Setup the PSR register with T bit set */
-    * (-- stack) = 0x01000000;
+    /* Hardware Frame (Popped by BX LR) */
+    *(--stack) = 0x01000000;                // xPSR (Must have bit 24 set)
+    *(--stack) = (uint32_t)task->entryFn;   // PC (Points to the actual function)
+    *(--stack) = 0xFFFFFFFD;                // LR (Task Return Address)
+    *(--stack) = 0x12121212;                // R12
+    *(--stack) = 0x03030303;                // R3
+    *(--stack) = 0x02020202;                // R2
+    *(--stack) = 0x01010101;                // R1
+    *(--stack) = 0x00000000;                // R0
 
-    /* Setup the PC register to the function entry point */
-    * (-- stack) = (uint32_t) task->entryFn;
+    /* Software Frame (Popped by LDMIA {R4-R11}) */
+    *(--stack) = 0x11111111;             // R11
+    *(--stack) = 0x10101010;             // R10
+    *(--stack) = 0x09090909;             // R9
+    *(--stack) = 0x08080808;             // R8
+    *(--stack) = 0x07070707;             // R7
+    *(--stack) = 0x06060606;             // R6
+    *(--stack) = 0x05050505;             // R5
+    *(--stack) = 0x04040404;             // R4
 
-    /* 
-    Setup the LR - Tasks should not return 
-    TODO: Add the feature for a task to return
-    */
-    * (-- stack) = 0xDEADBEEF;
-
-    for (size_t i = 0; i < DUMMY_REGISTERS_NUM; i++)
-    {
-        /* Setup the GP Register (i.e. R4, R11, ...) with a dummy value */
-        * (-- stack) = 0xDEADBEEF;
-    }
-    
-    /* Save current stack pointer */
+    /* Point the TCB to the bottom of this 16-word block */
     task->currentStackPtr = stack;
 }
 
@@ -343,7 +358,7 @@ static void zIdleTask (void)
     while (1)
     {
         /* Do nothing */
-        __asm volatile ("nop");
+        __asm volatile ("nop    \t\n");
         /* Never return */
     }
     
@@ -360,26 +375,26 @@ static STATUS zCreateIdleTask (void)
     }
 
     /* Allocate space for idle task stack */
-    idleTcb->stackPtr = (void *) calloc (   IDLE_TASK_STACK_SIZE, 
-                                            sizeof (uint32_t));
+    idleTcb->stackPtr = (void *) malloc (IDLE_TASK_STACK_SIZE);
     if (idleTcb->stackPtr == NULL)
     {
         return ERROR;
     }
+
+    (void) memset (idleTcb->stackPtr, 0, IDLE_TASK_STACK_SIZE);
 
     idleTcb->stackSize = IDLE_TASK_STACK_SIZE;
     (void) strncpy (idleTcb->name, IDLE_TASK_NAME, MAX_TASK_NAME);
     idleTcb->entryFn = zIdleTask;
     idleTcb->status = TASK_RUNNING; /* Idle task has to be ALWAYS running */
 
-    /* Add idle task to the list */
-    if (sllInsertBack (taskList, (void *) idleTcb) != OK)
-    {
-        return ERROR;
-    }
+    zSetupTaskStack (idleTcb);
 
     /* Save in the global context */
     idleTask = idleTcb;
+
+    /* Set current Task to the idle one */
+    currentTask = idleTask;
 
     return OK;
 }

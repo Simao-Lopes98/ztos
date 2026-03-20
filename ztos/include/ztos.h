@@ -32,13 +32,14 @@ typedef void (* zTaskHandler) ();
 typedef enum
 {
     TASK_RUNNING,
+    TASK_READY,
     TASK_STOPPED
 }zTaskStatus_t;
 
 typedef struct
 {
-    void * stackPtr;        /* Has to be 1st element for easy access on ASM */
-    void * currentStackPtr;
+    void * currentStackPtr; /* Has to be 1st element for easy access on ASM */
+    void * stackPtr;        
     uint32_t stackSize;
     char name [MAX_TASK_NAME];
     zTaskHandler entryFn;
@@ -47,6 +48,11 @@ typedef struct
 } zTask_t;
 
 /* Public functions */
-
+STATUS zSchedInit (void);
+STATUS zTaskCreate (char * name,
+                    uint32_t stackSize,
+                    zTaskHandler taskEntryFn);
+zTask_t * zGetTaskByName (char * name);
+STATUS zTaskDelay (uint64_t ticks);
 
 #endif /* ZTOS_H */
